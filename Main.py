@@ -6,6 +6,9 @@ import tensorflow as tf
 from collections import deque
 from typing import List, Tuple
 import argparse
+import datetime
+from docx import Document
+import asyncio
 
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
@@ -42,6 +45,12 @@ file_types = {
     "archives": [".zip", ".rar", ".tar", ".gz"],
 }
 
+# Keywords for Dynamic Folder Naming
+dynamic_folders = {
+    "work": ["report", "meeting", "project"],
+    "personal": ["holiday", "family", "travel"],
+}
+
 # Helper Functions
 def get_file_type(file_name: str) -> str:
     """Determine the type of a file based on its extension."""
@@ -51,19 +60,55 @@ def get_file_type(file_name: str) -> str:
             return folder
     return "other"
 
-def get_state(files: List[str], current_index: int) -> np.ndarray:
+def read_text_file(file_path: str) -> str:
+    """Read the content of a text file."""
+    try:
+        if file_path.endswith(".txt"):
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        elif file_path.endswith(".docx"):
+            doc = Document(file_path)
+            return "\n".join([para.text for para in doc.paragraphs])
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+    return ""
+
+def extract_keywords(content: str) -> List[str]:
+    """Extract keywords from file content."""
+    words = content.split()
+    return [word.lower() for word in words if len(word) > 3]
+
+def get_state(file_name: str) -> np.ndarray:
     """Create a state representation for the agent."""
-    # One-hot encoding of the current file type
-    file_type = get_file_type(files[current_index])
+    file_type = get_file_type(file_name)
+    file_size = os.path.getsize(file_name) / (1024 * 1024)  # Size in MB
+    creation_date = os.path.getctime(file_name)
+    creation_date = datetime.datetime.fromtimestamp(creation_date).strftime("%Y-%m-%d")
+
+    # Read text files for additional context
+    content = ""
+    if file_type == "documents":
+        content = read_text_file(file_name)
+    keywords = extract_keywords(content)
+
+    # One-hot encoding of file type
     state = np.zeros(len(file_types) + 1, dtype=np.float32)  # +1 for "other"
     if file_type in file_types:
         state[list(file_types.keys()).index(file_type)] = 1.0
     else:
         state[-1] = 1.0  # "other" category
+
+    # Add metadata to the state
+    state = np.append(state, [file_size, float(creation_date.split("-")[0])])  # Year as a feature
+
+    # Add keyword presence
+    for folder, keywords_list in dynamic_folders.items():
+        state = np.append(state, [1 if any(keyword in keywords for keyword in keywords_list) else 0])
+
     return state
 
-def move_file(source: str, destination: str) -> bool:
-    """Move a file from source to destination."""
+async def move_file(source: str, destination: str) -> bool:
+    """Move a file from source to destination asynchronously."""
     try:
         # Ensure the destination folder exists
         destination_folder = os.path.dirname(destination)
@@ -71,7 +116,7 @@ def move_file(source: str, destination: str) -> bool:
             os.makedirs(destination_folder)
             print(f"Created folder: {destination_folder}")
 
-        shutil.move(source, destination)
+        await asyncio.to_thread(shutil.move, source, destination)
         print(f"Moved: {source} -> {destination}")  # Log the move
         return True
     except Exception as e:
@@ -117,8 +162,8 @@ class FileOrganizerAgent:
         self.epsilon = settings["epsilon"]
 
         # Create Dueling DQN models
-        self.model = build_dueling_dqn((len(file_types) + 1,), num_actions)
-        self.target_model = build_dueling_dqn((len(file_types) + 1,), num_actions)
+        self.model = build_dueling_dqn((len(file_types) + 1 + 2 + len(dynamic_folders),), num_actions)
+        self.target_model = build_dueling_dqn((len(file_types) + 1 + 2 + len(dynamic_folders),), num_actions)
         self.target_model.set_weights(self.model.get_weights())
 
     def act(self, state: np.ndarray) -> int:
@@ -168,9 +213,9 @@ class FileOrganizerAgent:
         """Update the target model with the current model's weights."""
         self.target_model.set_weights(self.model.get_weights())
 
-    def step(self, files: List[str], current_index: int) -> Tuple[bool, float]:
+    async def step(self, files: List[str], current_index: int) -> Tuple[bool, float]:
         """Perform one step of the simulation."""
-        state = get_state(files, current_index)
+        state = get_state(files[current_index])
         action = self.act(state)
 
         file_name = files[current_index]
@@ -180,7 +225,7 @@ class FileOrganizerAgent:
         # Move the file
         if action < len(file_types):
             destination = os.path.join(destination_folder, file_name)
-            success = move_file(file_name, destination)
+            success = await move_file(file_name, destination)
         else:
             success = True  # No move
 
@@ -202,7 +247,7 @@ class FileOrganizerAgent:
         done = (current_index >= len(files) - 1) or (self.energy <= 0)
 
         # Store experience
-        next_state = get_state(files, current_index + 1) if not done else state
+        next_state = get_state(files[current_index + 1]) if not done else state
         self.remember(state, action, reward, next_state, done)
 
         # Train the agent
@@ -211,7 +256,7 @@ class FileOrganizerAgent:
         return not done, reward
 
 # Main Simulation Loop
-def run_simulation(directory: str):
+async def run_simulation(directory: str):
     """Run the file organizer simulation."""
     files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
     agent = FileOrganizerAgent(num_actions=len(file_types) + 1)
@@ -222,7 +267,7 @@ def run_simulation(directory: str):
 
     try:
         while current_index < len(files):
-            alive, reward = agent.step(files, current_index)
+            alive, reward = await agent.step(files, current_index)
             total_reward += reward
             if not alive:
                 print("Episode ended.")
@@ -254,4 +299,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     directory_to_organize = args.directory
-    run_simulation(directory_to_organize)
+    asyncio.run(run_simulation(directory_to_organize))
