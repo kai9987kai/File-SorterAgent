@@ -1,302 +1,798 @@
-import os
-import shutil
-import random
-import numpy as np
-import tensorflow as tf
-from collections import deque
-from typing import List, Tuple
+from __future__ import annotations
+
 import argparse
-import datetime
-from docx import Document
-import asyncio
+import fnmatch
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import sys
+import uuid
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
 
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
-tf.get_logger().setLevel('ERROR')  # Suppress TensorFlow warnings
 
-# Global Configuration
-settings = {
-    "agent": {
-        "max_steps": 1000,  # Maximum steps per episode
-        "energy": 100,      # Energy level (simulated)
-        "energy_decay": 0.1,
-        "energy_regeneration": 0.02,
-    },
-    "memory_size": 20000,
-    "batch_size": 64,
-    "gamma": 0.99,
-    "epsilon": 1.0,
-    "epsilon_min": 0.05,
-    "epsilon_decay": 0.995,
-    "learning_rate": 0.0005,
-    "reward": {
-        "correct_move": 20,  # Increased reward for correct moves
-        "incorrect_move": -20,  # Increased penalty for incorrect moves
-        "no_move": -1,  # Small penalty for not moving a file
-    },
+VERSION = "2.0.0"
+HISTORY_DIRECTORY = ".file-sorter"
+HISTORY_FILE = "history.jsonl"
+
+DEFAULT_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "Documents": (
+        ".csv", ".doc", ".docx", ".epub", ".key", ".md", ".mobi", ".odt",
+        ".ods", ".odp", ".pages", ".pdf", ".ppt", ".pptx", ".rtf", ".tex",
+        ".txt", ".xls", ".xlsx",
+    ),
+    "Images": (
+        ".avif", ".bmp", ".cr2", ".dng", ".gif", ".heic", ".ico", ".jpeg",
+        ".jpg", ".nef", ".png", ".raw", ".svg", ".tif", ".tiff", ".webp",
+    ),
+    "Videos": (
+        ".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg",
+        ".mpg", ".mts", ".vob", ".webm", ".wmv",
+    ),
+    "Audio": (
+        ".aac", ".aiff", ".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg",
+        ".opus", ".wav", ".wma",
+    ),
+    "Archives": (
+        ".7z", ".bz2", ".cab", ".gz", ".iso", ".rar", ".tar", ".tgz", ".xz",
+        ".zip",
+    ),
+    "Code": (
+        ".bat", ".c", ".cmd", ".cpp", ".cs", ".css", ".go", ".h", ".html",
+        ".java", ".js", ".jsx", ".json", ".lua", ".php", ".ps1", ".py", ".rb",
+        ".rs", ".scss", ".sh", ".sql", ".ts", ".tsx", ".vue", ".xml",
+    ),
+    "Data": (
+        ".db", ".feather", ".h5", ".hdf5", ".npy", ".parquet", ".pkl",
+        ".rdata", ".sav", ".sqlite", ".yaml", ".yml",
+    ),
+    "Applications": (".appimage", ".apk", ".dmg", ".exe", ".jar", ".msi"),
+    "Design": (
+        ".3ds", ".ai", ".blend", ".dae", ".dwg", ".dxf", ".fbx", ".fig",
+        ".gltf", ".glb", ".obj", ".psd", ".sketch", ".step", ".stl",
+    ),
+    "Fonts": (".eot", ".otf", ".ttf", ".woff", ".woff2"),
 }
 
-# File Types and Corresponding Folders
-file_types = {
-    "documents": [".pdf", ".docx", ".txt", ".xlsx", ".pptx"],
-    "images": [".jpg", ".png", ".jpeg", ".gif", ".bmp"],
-    "videos": [".mp4", ".mkv", ".avi", ".mov"],
-    "music": [".mp3", ".wav", ".flac", ".aac"],
-    "archives": [".zip", ".rar", ".tar", ".gz"],
+DEFAULT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "Work": ("agenda", "client", "contract", "invoice", "meeting", "project", "report"),
+    "Personal": ("family", "holiday", "personal", "receipt", "tax", "travel"),
 }
 
-# Keywords for Dynamic Folder Naming
-dynamic_folders = {
-    "work": ["report", "meeting", "project"],
-    "personal": ["holiday", "family", "travel"],
+DEFAULT_IGNORE_PATTERNS = (
+    "*.crdownload",
+    "*.download",
+    "*.part",
+    "~$*",
+)
+
+TEXT_EXTENSIONS = {
+    ".csv", ".css", ".html", ".ini", ".js", ".json", ".log", ".md", ".py",
+    ".rtf", ".sql", ".tex", ".ts", ".txt", ".xml", ".yaml", ".yml",
 }
 
-# Helper Functions
-def get_file_type(file_name: str) -> str:
-    """Determine the type of a file based on its extension."""
-    _, ext = os.path.splitext(file_name)
-    for folder, extensions in file_types.items():
-        if ext.lower() in extensions:
-            return folder
-    return "other"
 
-def read_text_file(file_path: str) -> str:
-    """Read the content of a text file."""
-    try:
-        if file_path.endswith(".txt"):
-            with open(file_path, "r", encoding="utf-8") as f:
-                return f.read()
-        elif file_path.endswith(".docx"):
-            doc = Document(file_path)
-            return "\n".join([para.text for para in doc.paragraphs])
-    except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
-    return ""
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def extract_keywords(content: str) -> List[str]:
-    """Extract keywords from file content."""
-    words = content.split()
-    return [word.lower() for word in words if len(word) > 3]
 
-def get_state(file_name: str) -> np.ndarray:
-    """Create a state representation for the agent."""
-    file_type = get_file_type(file_name)
-    file_size = os.path.getsize(file_name) / (1024 * 1024)  # Size in MB
-    creation_date = os.path.getctime(file_name)
-    creation_date = datetime.datetime.fromtimestamp(creation_date).strftime("%Y-%m-%d")
+def normalize_extension(extension: str) -> str:
+    extension = extension.strip().lower()
+    return extension if extension.startswith(".") else f".{extension}"
 
-    # Read text files for additional context
-    content = ""
-    if file_type == "documents":
-        content = read_text_file(file_name)
-    keywords = extract_keywords(content)
 
-    # One-hot encoding of file type
-    state = np.zeros(len(file_types) + 1, dtype=np.float32)  # +1 for "other"
-    if file_type in file_types:
-        state[list(file_types.keys()).index(file_type)] = 1.0
-    else:
-        state[-1] = 1.0  # "other" category
+def validate_category(category: str) -> None:
+    if (
+        not category.strip()
+        or category in {".", ".."}
+        or "/" in category
+        or "\\" in category
+        or Path(category).is_absolute()
+    ):
+        raise ValueError(f"Invalid category name: {category!r}")
 
-    # Add metadata to the state
-    state = np.append(state, [file_size, float(creation_date.split("-")[0])])  # Year as a feature
 
-    # Add keyword presence
-    for folder, keywords_list in dynamic_folders.items():
-        state = np.append(state, [1 if any(keyword in keywords for keyword in keywords_list) else 0])
+@dataclass
+class SortConfig:
+    categories: dict[str, tuple[str, ...]]
+    keyword_rules: dict[str, tuple[str, ...]]
+    ignore_patterns: tuple[str, ...]
+    content_read_limit: int = 256_000
 
-    return state
+    @classmethod
+    def defaults(cls) -> "SortConfig":
+        return cls(
+            categories=dict(DEFAULT_CATEGORIES),
+            keyword_rules=dict(DEFAULT_KEYWORDS),
+            ignore_patterns=DEFAULT_IGNORE_PATTERNS,
+        )
 
-async def move_file(source: str, destination: str) -> bool:
-    """Move a file from source to destination asynchronously."""
-    try:
-        # Ensure the destination folder exists
-        destination_folder = os.path.dirname(destination)
-        if not os.path.exists(destination_folder):
-            os.makedirs(destination_folder)
-            print(f"Created folder: {destination_folder}")
+    @classmethod
+    def load(cls, path: Path | None) -> "SortConfig":
+        config = cls.defaults()
+        if path is None:
+            return config
 
-        await asyncio.to_thread(shutil.move, source, destination)
-        print(f"Moved: {source} -> {destination}")  # Log the move
-        return True
-    except Exception as e:
-        print(f"Error moving file: {e}")
-        return False
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        if not isinstance(raw, dict):
+            raise ValueError("Configuration root must be a JSON object")
 
-# Dueling DQN Model
-def build_dueling_dqn(input_shape: Tuple[int], num_actions: int) -> tf.keras.Model:
-    """Build a Dueling DQN model."""
-    inputs = tf.keras.layers.Input(shape=input_shape)
-    x = tf.keras.layers.Dense(64, activation="relu")(inputs)
-    x = tf.keras.layers.Dense(32, activation="relu")(x)
+        if "categories" in raw:
+            config.categories = _merge_rule_map(config.categories, raw["categories"], "categories")
+        if "keyword_rules" in raw:
+            config.keyword_rules = _merge_rule_map(
+                config.keyword_rules, raw["keyword_rules"], "keyword_rules", extensions=False
+            )
+        if "ignore_patterns" in raw:
+            if not isinstance(raw["ignore_patterns"], list):
+                raise ValueError("'ignore_patterns' must be a list")
+            config.ignore_patterns = tuple(str(pattern) for pattern in raw["ignore_patterns"])
+        if "content_read_limit" in raw:
+            config.content_read_limit = int(raw["content_read_limit"])
+            if config.content_read_limit < 1:
+                raise ValueError("'content_read_limit' must be positive")
 
-    # Value stream
-    value = tf.keras.layers.Dense(1, activation="linear")(x)
+        return config
 
-    # Advantage stream
-    advantage = tf.keras.layers.Dense(num_actions, activation="linear")(x)
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "categories": {name: list(values) for name, values in self.categories.items()},
+            "keyword_rules": {name: list(values) for name, values in self.keyword_rules.items()},
+            "ignore_patterns": list(self.ignore_patterns),
+            "content_read_limit": self.content_read_limit,
+        }
 
-    # Combine value and advantage using Keras layers
-    mean_advantage = tf.keras.layers.Lambda(lambda x: tf.reduce_mean(x, axis=1, keepdims=True))(advantage)
-    q_values = tf.keras.layers.Add()([value, tf.keras.layers.Subtract()([advantage, mean_advantage])])
 
-    model = tf.keras.Model(inputs=inputs, outputs=q_values)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=settings["learning_rate"]), loss="mse")
-    return model
+def _merge_rule_map(
+    existing: dict[str, tuple[str, ...]],
+    new_rules: Any,
+    field_name: str,
+    *,
+    extensions: bool = True,
+) -> dict[str, tuple[str, ...]]:
+    if not isinstance(new_rules, dict):
+        raise ValueError(f"'{field_name}' must be an object")
+    merged = dict(existing)
+    for category, values in new_rules.items():
+        validate_category(category)
+        if not isinstance(values, list):
+            raise ValueError(f"Rule values for {category!r} must be a list")
+        normalized = [
+            normalize_extension(str(value)) if extensions else str(value).strip().lower()
+            for value in values
+            if str(value).strip()
+        ]
+        # Reinsert customized categories last so their rules override defaults.
+        merged.pop(category, None)
+        merged[category] = tuple(dict.fromkeys(normalized))
+    return merged
 
-# Agent Class
-class FileOrganizerAgent:
-    def __init__(self, num_actions: int):
-        """
-        Actions:
-         0: Move to "documents"
-         1: Move to "images"
-         2: Move to "videos"
-         3: Move to "music"
-         4: Move to "archives"
-         5: Do not move (leave in "other")
-        """
-        self.num_actions = num_actions
-        self.energy = settings["agent"]["energy"]
-        self.memory = deque(maxlen=settings["memory_size"])
-        self.epsilon = settings["epsilon"]
 
-        # Create Dueling DQN models
-        self.model = build_dueling_dqn((len(file_types) + 1 + 2 + len(dynamic_folders),), num_actions)
-        self.target_model = build_dueling_dqn((len(file_types) + 1 + 2 + len(dynamic_folders),), num_actions)
-        self.target_model.set_weights(self.model.get_weights())
+@dataclass
+class SortAction:
+    source: Path
+    destination: Path | None
+    category: str
+    reason: str
+    size: int
+    status: str = "planned"
+    error: str | None = None
 
-    def act(self, state: np.ndarray) -> int:
-        """Epsilon-greedy policy."""
-        if np.random.rand() < self.epsilon:
-            return np.random.randint(self.num_actions)
-        q_values = self.model.predict(state[np.newaxis, ...], verbose=0)[0]
-        return np.argmax(q_values)
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": str(self.source),
+            "destination": str(self.destination) if self.destination else None,
+            "category": self.category,
+            "reason": self.reason,
+            "size": self.size,
+            "status": self.status,
+            "error": self.error,
+        }
 
-    def remember(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool):
-        """Store experience in memory."""
-        self.memory.append((state, action, reward, next_state, done))
 
-    def replay(self):
-        """Train the model using experiences from memory."""
-        if len(self.memory) < settings["batch_size"]:
-            return
+class HistoryStore:
+    def __init__(self, destination_root: Path):
+        self.directory = destination_root / HISTORY_DIRECTORY
+        self.path = self.directory / HISTORY_FILE
 
-        batch = random.sample(self.memory, settings["batch_size"])
-        states, actions, rewards, next_states, dones = zip(*batch)
-        states = np.array(states, dtype=np.float32)
-        next_states = np.array(next_states, dtype=np.float32)
-        rewards = np.array(rewards, dtype=np.float32)
-        dones = np.array(dones, dtype=np.float32)
+    def append(self, record: dict[str, Any]) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
 
-        # Double DQN update
-        next_q_local = self.model.predict(next_states, verbose=0)
-        next_actions = np.argmax(next_q_local, axis=1)
-        q_target_vals = self.target_model.predict(next_states, verbose=0)
+    def records(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid history entry on line {line_number}") from exc
+        return records
 
-        target_f = self.model.predict(states, verbose=0)
-        for i in range(settings["batch_size"]):
-            a = next_actions[i]
-            if dones[i]:
-                target = rewards[i]
-            else:
-                target = rewards[i] + settings["gamma"] * q_target_vals[i][a]
-            target_f[i][actions[i]] = target
+    def find_sort_run(self, run_id: str) -> dict[str, Any] | None:
+        records = self.records()
+        undone = {
+            record.get("target_run_id")
+            for record in records
+            if record.get("type") == "undo"
+        }
+        for record in reversed(records):
+            if record.get("type") != "sort":
+                continue
+            if run_id == "latest" and record.get("run_id") not in undone:
+                return record
+            if record.get("run_id") == run_id:
+                return record
+        return None
 
-        self.model.fit(states, target_f, epochs=1, verbose=0)
 
-        # Decay epsilon
-        if self.epsilon > settings["epsilon_min"]:
-            self.epsilon *= settings["epsilon_decay"]
+class FileSorter:
+    def __init__(
+        self,
+        source_root: Path,
+        destination_root: Path,
+        config: SortConfig,
+        *,
+        recursive: bool = False,
+        include_hidden: bool = False,
+        inspect_content: bool = False,
+        group_by: str = "none",
+        min_age: float = 0,
+        collision: str = "rename",
+        duplicate_action: str = "skip",
+    ):
+        self.source_root = source_root.expanduser().resolve()
+        self.destination_root = destination_root.expanduser().resolve()
+        self.config = config
+        self.recursive = recursive
+        self.include_hidden = include_hidden
+        self.inspect_content = inspect_content
+        self.group_by = group_by
+        self.min_age = min_age
+        self.collision = collision
+        self.duplicate_action = duplicate_action
+        self._extension_map = self._build_extension_map()
+        self._managed_directories = {
+            *config.categories,
+            *config.keyword_rules,
+            "Other",
+            "Duplicates",
+            HISTORY_DIRECTORY,
+        }
 
-    def update_target_model(self):
-        """Update the target model with the current model's weights."""
-        self.target_model.set_weights(self.model.get_weights())
+    def _build_extension_map(self) -> dict[str, str]:
+        extension_map: dict[str, str] = {}
+        for category, extensions in self.config.categories.items():
+            validate_category(category)
+            for extension in extensions:
+                extension_map[normalize_extension(extension)] = category
+        for category in self.config.keyword_rules:
+            validate_category(category)
+        return extension_map
 
-    async def step(self, files: List[str], current_index: int) -> Tuple[bool, float]:
-        """Perform one step of the simulation."""
-        state = get_state(files[current_index])
-        action = self.act(state)
+    def classify(self, path: Path) -> tuple[str, str]:
+        searchable_name = re.sub(r"[_\-.]+", " ", path.stem.lower())
+        for category, keywords in self.config.keyword_rules.items():
+            matched = self._find_keyword(searchable_name, keywords)
+            if matched:
+                return category, f"filename keyword '{matched}'"
 
-        file_name = files[current_index]
-        file_type = get_file_type(file_name)
-        destination_folder = list(file_types.keys())[action] if action < len(file_types) else "other"
+        if self.inspect_content:
+            content = self._read_searchable_content(path).lower()
+            for category, keywords in self.config.keyword_rules.items():
+                matched = self._find_keyword(content, keywords)
+                if matched:
+                    return category, f"content keyword '{matched}'"
 
-        # Move the file
-        if action < len(file_types):
-            destination = os.path.join(destination_folder, file_name)
-            success = await move_file(file_name, destination)
+        extension = path.suffix.lower()
+        category = self._extension_map.get(extension)
+        if category:
+            return category, f"extension '{extension}'"
+        return "Other", "unmatched extension"
+
+    @staticmethod
+    def _find_keyword(content: str, keywords: tuple[str, ...]) -> str | None:
+        for keyword in keywords:
+            if keyword and re.search(
+                rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])",
+                content,
+                flags=re.IGNORECASE,
+            ):
+                return keyword
+        return None
+
+    def _read_searchable_content(self, path: Path) -> str:
+        try:
+            if path.suffix.lower() in TEXT_EXTENSIONS:
+                with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                    return handle.read(self.config.content_read_limit)
+            if path.suffix.lower() == ".docx":
+                with zipfile.ZipFile(path) as archive:
+                    with archive.open("word/document.xml") as document:
+                        xml = document.read(self.config.content_read_limit)
+                text = re.sub(rb"<[^>]+>", b" ", xml).decode("utf-8", errors="ignore")
+                return html.unescape(text)
+        except (OSError, KeyError, zipfile.BadZipFile):
+            return ""
+        return ""
+
+    def iter_files(self) -> Iterable[Path]:
+        if not self.source_root.is_dir():
+            raise FileNotFoundError(f"Source directory does not exist: {self.source_root}")
+
+        if not self.recursive:
+            candidates = (path for path in self.source_root.iterdir() if path.is_file())
         else:
-            success = True  # No move
+            candidates = self._walk_files()
 
-        # Calculate reward
-        if success:
-            if destination_folder == file_type:
-                reward = settings["reward"]["correct_move"]
-            else:
-                reward = settings["reward"]["incorrect_move"]
-        else:
-            reward = settings["reward"]["no_move"]
+        now = datetime.now().timestamp()
+        script_path = Path(__file__).resolve()
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved == script_path or self._is_ignored(path):
+                continue
+            try:
+                if self.min_age and now - path.stat().st_mtime < self.min_age:
+                    continue
+            except OSError:
+                continue
+            yield path
 
-        # Update energy
-        self.energy -= settings["agent"]["energy_decay"]
-        if self.energy < 0:
-            self.energy = 0
+    def _walk_files(self) -> Iterable[Path]:
+        for current, directories, files in os.walk(self.source_root):
+            current_path = Path(current)
+            kept_directories = []
+            for directory in directories:
+                candidate = current_path / directory
+                if self._should_skip_directory(candidate):
+                    continue
+                kept_directories.append(directory)
+            directories[:] = kept_directories
+            for filename in files:
+                yield current_path / filename
 
-        # Check if episode is done
-        done = (current_index >= len(files) - 1) or (self.energy <= 0)
+    def _should_skip_directory(self, path: Path) -> bool:
+        if path.name == HISTORY_DIRECTORY:
+            return True
+        if not self.include_hidden and path.name.startswith("."):
+            return True
+        if self.destination_root == self.source_root and path.parent == self.source_root:
+            if path.name in self._managed_directories:
+                return True
+        try:
+            if self.destination_root != self.source_root:
+                path.resolve().relative_to(self.destination_root)
+                return True
+        except ValueError:
+            pass
+        return self._matches_ignore(path)
 
-        # Store experience
-        next_state = get_state(files[current_index + 1]) if not done else state
-        self.remember(state, action, reward, next_state, done)
+    def _is_ignored(self, path: Path) -> bool:
+        if not self.include_hidden:
+            try:
+                relative_parts = path.relative_to(self.source_root).parts
+            except ValueError:
+                relative_parts = path.parts
+            if any(part.startswith(".") for part in relative_parts):
+                return True
+        return self._matches_ignore(path)
 
-        # Train the agent
-        self.replay()
+    def _matches_ignore(self, path: Path) -> bool:
+        try:
+            relative = path.relative_to(self.source_root).as_posix()
+        except ValueError:
+            relative = path.name
+        return any(
+            fnmatch.fnmatch(path.name, pattern) or fnmatch.fnmatch(relative, pattern)
+            for pattern in self.config.ignore_patterns
+        )
 
-        return not done, reward
+    def plan(self) -> list[SortAction]:
+        actions: list[SortAction] = []
+        reserved: set[str] = set()
+        for source in sorted(self.iter_files(), key=lambda item: str(item).casefold()):
+            try:
+                stat = source.stat()
+                category, reason = self.classify(source)
+                destination = self._destination_for(source, category, stat.st_mtime)
+                destination, status, error = self._resolve_destination(
+                    source, destination, category, stat.st_mtime, reserved
+                )
+                if destination is not None:
+                    reserved.add(os.path.normcase(str(destination)))
+                actions.append(
+                    SortAction(
+                        source=source.resolve(),
+                        destination=destination,
+                        category=category,
+                        reason=reason,
+                        size=stat.st_size,
+                        status=status,
+                        error=error,
+                    )
+                )
+            except OSError as exc:
+                actions.append(
+                    SortAction(source, None, "Unknown", "filesystem error", 0, "error", str(exc))
+                )
+        return actions
 
-# Main Simulation Loop
-async def run_simulation(directory: str):
-    """Run the file organizer simulation."""
-    files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
-    agent = FileOrganizerAgent(num_actions=len(file_types) + 1)
+    def _destination_for(self, source: Path, category: str, modified_at: float) -> Path:
+        destination = self.destination_root / category
+        modified = datetime.fromtimestamp(modified_at)
+        if self.group_by == "year":
+            destination /= f"{modified.year:04d}"
+        elif self.group_by == "month":
+            destination = destination / f"{modified.year:04d}" / f"{modified.month:02d}"
+        return destination / source.name
 
-    total_reward = 0.0
-    current_index = 0
-    update_target_counter = 0
+    def _resolve_destination(
+        self,
+        source: Path,
+        destination: Path,
+        category: str,
+        modified_at: float,
+        reserved: set[str],
+    ) -> tuple[Path | None, str, str | None]:
+        destination_key = os.path.normcase(str(destination))
+        if not destination.exists() and destination_key not in reserved:
+            return destination, "planned", None
 
-    try:
-        while current_index < len(files):
-            alive, reward = await agent.step(files, current_index)
-            total_reward += reward
-            if not alive:
-                print("Episode ended.")
-                break
+        if destination.exists() and self._same_content(source, destination):
+            if self.duplicate_action == "skip":
+                return destination, "duplicate", "identical file already exists"
+            if self.duplicate_action == "folder":
+                duplicate = self._destination_for(source, "Duplicates", modified_at)
+                duplicate = duplicate.parent / category / duplicate.name
+                return self._unique_destination(duplicate, reserved), "planned", None
 
-            current_index += 1
+        if self.collision == "skip":
+            return destination, "collision", "destination already exists"
+        return self._unique_destination(destination, reserved), "planned", None
 
-            # Update target network periodically
-            update_target_counter += 1
-            if update_target_counter % 100 == 0:
-                agent.update_target_model()
+    @staticmethod
+    def _same_content(first: Path, second: Path) -> bool:
+        try:
+            if first.stat().st_size != second.stat().st_size:
+                return False
+            return FileSorter._digest(first) == FileSorter._digest(second)
+        except OSError:
+            return False
 
-            print(f"Step: {current_index}, Reward: {reward}, Total Reward: {total_reward}")
+    @staticmethod
+    def _digest(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
-    except KeyboardInterrupt:
-        print("Simulation interrupted by user.")
+    @staticmethod
+    def _unique_destination(destination: Path, reserved: set[str]) -> Path:
+        counter = 1
+        candidate = destination
+        while candidate.exists() or os.path.normcase(str(candidate)) in reserved:
+            candidate = destination.with_name(
+                f"{destination.stem} ({counter}){destination.suffix}"
+            )
+            counter += 1
+        return candidate
 
-    print("Simulation ended.")
-    print(f"Total reward accumulated: {total_reward:.2f}")
+    def execute(self, actions: list[SortAction]) -> dict[str, Any]:
+        run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
+        for action in actions:
+            if action.status != "planned" or action.destination is None:
+                continue
+            try:
+                if not action.source.exists():
+                    raise FileNotFoundError("source no longer exists")
+                destination = action.destination
+                if destination.exists():
+                    destination = self._unique_destination(destination, set())
+                    action.destination = destination
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(action.source), str(destination))
+                action.status = "moved"
+            except OSError as exc:
+                action.status = "error"
+                action.error = str(exc)
 
-# Script Entry Point
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="File Organizer Agent")
-    parser.add_argument(
-        "--directory",
-        type=str,
-        default=".",
-        help="Directory to organize (default: current directory)",
+        record = {
+            "version": 1,
+            "type": "sort",
+            "run_id": run_id,
+            "created_at": utc_now(),
+            "source_root": str(self.source_root),
+            "destination_root": str(self.destination_root),
+            "options": {
+                "recursive": self.recursive,
+                "group_by": self.group_by,
+                "inspect_content": self.inspect_content,
+            },
+            "operations": [action.to_dict() for action in actions],
+        }
+        HistoryStore(self.destination_root).append(record)
+        return record
+
+
+def undo_run(destination_root: Path, requested_run_id: str) -> dict[str, Any]:
+    destination_root = destination_root.expanduser().resolve()
+    history = HistoryStore(destination_root)
+    target = history.find_sort_run(requested_run_id)
+    if target is None:
+        raise ValueError(f"No undoable sort run found for {requested_run_id!r}")
+
+    results = []
+    for operation in reversed(target.get("operations", [])):
+        if operation.get("status") != "moved":
+            continue
+        source = Path(operation["source"])
+        destination = Path(operation["destination"])
+        result = {
+            "source": str(destination),
+            "destination": str(source),
+            "status": "restored",
+            "error": None,
+        }
+        try:
+            if not destination.exists():
+                raise FileNotFoundError("sorted file no longer exists")
+            if source.exists():
+                raise FileExistsError("original path is occupied")
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(source))
+        except OSError as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+        results.append(result)
+
+    record = {
+        "version": 1,
+        "type": "undo",
+        "run_id": f"undo-{uuid.uuid4().hex[:8]}",
+        "target_run_id": target["run_id"],
+        "created_at": utc_now(),
+        "operations": results,
+    }
+    history.append(record)
+    return record
+
+
+def summarize_actions(actions: list[SortAction]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    categories: dict[str, int] = {}
+    total_bytes = 0
+    for action in actions:
+        counts[action.status] = counts.get(action.status, 0) + 1
+        categories[action.category] = categories.get(action.category, 0) + 1
+        if action.status in {"planned", "moved"}:
+            total_bytes += action.size
+    return {
+        "total": len(actions),
+        "counts": counts,
+        "categories": categories,
+        "bytes": total_bytes,
+    }
+
+
+def human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def print_plan(actions: list[SortAction], source_root: Path, *, executed: bool) -> None:
+    if not actions:
+        print("No eligible files found.")
+        return
+    for action in actions:
+        try:
+            source = action.source.relative_to(source_root.resolve())
+        except ValueError:
+            source = action.source
+        destination = action.destination or Path("-")
+        marker = {
+            "planned": "PLAN",
+            "moved": "MOVE",
+            "duplicate": "SKIP",
+            "collision": "SKIP",
+            "error": "ERR ",
+        }.get(action.status, action.status.upper())
+        print(f"[{marker}] {source} -> {destination} ({action.reason})")
+        if action.error:
+            print(f"       {action.error}")
+
+    summary = summarize_actions(actions)
+    verb = "Processed" if executed else "Previewed"
+    print(
+        f"\n{verb} {summary['total']} file(s), "
+        f"{human_size(summary['bytes'])} eligible to move."
     )
-    args = parser.parse_args()
-    directory_to_organize = args.directory
-    asyncio.run(run_simulation(directory_to_organize))
+    print("Categories: " + ", ".join(
+        f"{category}={count}" for category, count in sorted(summary["categories"].items())
+    ))
+
+
+def print_history(destination_root: Path, *, as_json: bool) -> None:
+    records = HistoryStore(destination_root.resolve()).records()
+    if as_json:
+        print(json.dumps(records, indent=2))
+        return
+    if not records:
+        print("No history found.")
+        return
+    for record in records:
+        operations = record.get("operations", [])
+        successful = sum(
+            item.get("status") in {"moved", "restored"} for item in operations
+        )
+        target = f" target={record['target_run_id']}" if record.get("target_run_id") else ""
+        print(
+            f"{record.get('created_at', '?')}  {record.get('type', '?'):4}  "
+            f"{record.get('run_id', '?')}  successful={successful}{target}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Safely organize files with deterministic, reversible rules."
+    )
+    parser.add_argument("directory", nargs="?", default=".", help="directory to organize")
+    parser.add_argument(
+        "--destination",
+        type=Path,
+        help="destination root (default: organize inside the source directory)",
+    )
+    parser.add_argument("--execute", action="store_true", help="apply the previewed moves")
+    parser.add_argument("--recursive", action="store_true", help="include nested directories")
+    parser.add_argument("--include-hidden", action="store_true", help="include hidden files")
+    parser.add_argument(
+        "--content",
+        action="store_true",
+        help="inspect text and DOCX content for keyword rules",
+    )
+    parser.add_argument(
+        "--group-by",
+        choices=("none", "year", "month"),
+        default="none",
+        help="create date-based subdirectories",
+    )
+    parser.add_argument(
+        "--min-age",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="ignore files modified more recently than this",
+    )
+    parser.add_argument(
+        "--collision",
+        choices=("rename", "skip"),
+        default="rename",
+        help="handling for different files with the same name",
+    )
+    parser.add_argument(
+        "--duplicates",
+        choices=("skip", "rename", "folder"),
+        default="skip",
+        help="handling for identical files at the destination",
+    )
+    parser.add_argument("--config", type=Path, help="JSON rules file")
+    parser.add_argument(
+        "--init-config",
+        type=Path,
+        metavar="PATH",
+        help="write an editable default configuration and exit",
+    )
+    parser.add_argument(
+        "--undo",
+        nargs="?",
+        const="latest",
+        metavar="RUN_ID",
+        help="undo the latest run, or the supplied run ID",
+    )
+    parser.add_argument("--history", action="store_true", help="show run history and exit")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    source_root = Path(args.directory).expanduser().resolve()
+    destination_root = (
+        args.destination.expanduser().resolve() if args.destination else source_root
+    )
+
+    try:
+        if args.init_config:
+            output = args.init_config.expanduser().resolve()
+            if output.exists():
+                raise FileExistsError(f"Refusing to overwrite existing file: {output}")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                json.dumps(SortConfig.defaults().to_dict(), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(f"Wrote configuration: {output}")
+            return 0
+
+        if args.history:
+            print_history(destination_root, as_json=args.json)
+            return 0
+
+        if args.undo:
+            record = undo_run(destination_root, args.undo)
+            restored = sum(
+                operation["status"] == "restored"
+                for operation in record["operations"]
+            )
+            errors = len(record["operations"]) - restored
+            if args.json:
+                print(json.dumps(record, indent=2))
+            else:
+                print(
+                    f"Undid {record['target_run_id']}: restored={restored}, errors={errors}"
+                )
+                for operation in record["operations"]:
+                    if operation["error"]:
+                        print(f"[ERR ] {operation['source']}: {operation['error']}")
+            return 0 if not errors else 1
+
+        config = SortConfig.load(args.config)
+        sorter = FileSorter(
+            source_root,
+            destination_root,
+            config,
+            recursive=args.recursive,
+            include_hidden=args.include_hidden,
+            inspect_content=args.content,
+            group_by=args.group_by,
+            min_age=args.min_age,
+            collision=args.collision,
+            duplicate_action=args.duplicates,
+        )
+        actions = sorter.plan()
+        record = sorter.execute(actions) if args.execute else None
+
+        if args.json:
+            payload = {
+                "mode": "execute" if args.execute else "preview",
+                "summary": summarize_actions(actions),
+                "actions": [action.to_dict() for action in actions],
+                "run_id": record["run_id"] if record else None,
+            }
+            print(json.dumps(payload, indent=2))
+        else:
+            print_plan(actions, source_root, executed=args.execute)
+            if record:
+                print(f"Run ID: {record['run_id']}")
+                print(f"Undo with: {Path(sys.argv[0]).name} --undo {record['run_id']}")
+            elif actions:
+                print("\nPreview only. Add --execute to apply these moves.")
+        return 1 if any(action.status == "error" for action in actions) else 0
+    except (FileNotFoundError, FileExistsError, ValueError, json.JSONDecodeError) as exc:
+        if args.json:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

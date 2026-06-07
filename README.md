@@ -1,101 +1,169 @@
-### Updated Description and Instructions for the **File-SorterAgent**
+# File Sorter Agent
 
-The **File-SorterAgent** is an advanced reinforcement learning-based system designed to automatically organize files in a directory. It uses a neural network to decide which folder a file should be moved to (e.g., `documents`, `images`, `music`) based on its type, content, and metadata. The agent learns through trial and error, receiving rewards for correct moves and penalties for mistakes. Over time, it improves its accuracy by training on past experiences, making it an efficient and adaptive solution for file organization.
+File Sorter Agent is a safe, deterministic command-line organizer for Windows,
+macOS, and Linux. It previews every change, handles naming conflicts, detects
+duplicates, records applied runs, and can undo them.
 
----
+The original TensorFlow reinforcement-learning prototype is retained in
+`beta.py` for experimentation. It is not used by the production sorter because
+an untrained model makes random file-placement decisions.
 
-### Key Features:
-1. **File Type Detection**: Automatically detects file types using extensions (e.g., `.pdf`, `.jpg`, `.mp3`).
-2. **Content Analysis**: Reads text files (`.txt`, `.docx`) to extract keywords for better categorization.
-3. **Dynamic Folder Creation**: Creates folders like `work` or `personal` based on file content or metadata.
-4. **Asynchronous Operations**: Moves files asynchronously for improved performance.
-5. **Enhanced State Representation**: Uses file size, creation date, and content keywords to make better decisions.
-6. **User Feedback**: Allows users to provide feedback to improve the agent's learning (future implementation).
+## Highlights
 
----
+- Safe preview mode by default; files move only with `--execute`
+- 10 built-in categories covering common documents, media, code, data, apps,
+  design files, and fonts
+- Filename and optional text/DOCX content rules for `Work` and `Personal`
+- Recursive operation with managed output folders automatically excluded
+- Collision-safe renaming and SHA-256 duplicate detection
+- Optional year or year/month grouping
+- JSON configuration, JSON output, ignore patterns, and minimum file age
+- Persistent run history and reversible moves
+- No required third-party Python packages
 
-### Instructions for Using the File-SorterAgent
+## Requirements
 
-Follow these steps to use the **File-SorterAgent** to automatically organize files in a directory:
+Python 3.10 or newer.
 
----
+## Quick Start
 
-### 1. **Prerequisites**
-- **Python 3.x** installed on your system.
-- Required Python libraries: `numpy`, `tensorflow`, `argparse`, `shutil`, `python-docx`.
+Preview a Downloads folder:
 
----
+```powershell
+python Main.py "$HOME\Downloads"
+```
 
-### 2. **Install Required Libraries**
-Run the following command to install the necessary libraries:
+Apply exactly that style of plan:
 
-```bash
+```powershell
+python Main.py "$HOME\Downloads" --execute
+```
+
+The preview is recalculated when `--execute` runs, so review the output again if
+the directory changed between commands.
+
+## Common Workflows
+
+Sort nested files and group them by year and month:
+
+```powershell
+python Main.py "$HOME\Downloads" --recursive --group-by month --execute
+```
+
+Inspect text and DOCX content for work/personal keywords:
+
+```powershell
+python Main.py "$HOME\Downloads" --content
+```
+
+Place organized files under a separate destination:
+
+```powershell
+python Main.py "D:\Inbox" --destination "D:\Organized" --execute
+```
+
+Skip recently modified files, useful when downloads may still be active:
+
+```powershell
+python Main.py "$HOME\Downloads" --min-age 300 --execute
+```
+
+Emit machine-readable output:
+
+```powershell
+python Main.py "$HOME\Downloads" --json
+```
+
+## Undo And History
+
+Every executed run is written to:
+
+```text
+<destination>/.file-sorter/history.jsonl
+```
+
+Undo the latest run:
+
+```powershell
+python Main.py "$HOME\Downloads" --undo
+```
+
+Undo a specific run:
+
+```powershell
+python Main.py "$HOME\Downloads" --undo 20260607T120000Z-ab12cd34
+```
+
+Show available run IDs:
+
+```powershell
+python Main.py "$HOME\Downloads" --history
+```
+
+Undo never overwrites a file. If the original path is occupied or a sorted file
+was moved again, that item is reported as an error and left untouched.
+
+## Duplicate And Collision Handling
+
+Identical destination files are skipped by default:
+
+```powershell
+python Main.py . --duplicates skip
+```
+
+Alternatives are `--duplicates rename` and `--duplicates folder`. Different
+files with the same name receive `name (1).ext` by default. Use
+`--collision skip` to leave those source files untouched instead.
+
+## Custom Rules
+
+Generate a complete editable configuration:
+
+```powershell
+python Main.py --init-config sorter-config.json
+```
+
+Then run with it:
+
+```powershell
+python Main.py "$HOME\Downloads" --config sorter-config.json
+```
+
+Configuration values merge with the built-in rules. Reusing a category name
+replaces that category's values:
+
+```json
+{
+  "categories": {
+    "Design": [".fig", ".sketch", ".xd"],
+    "Books": [".epub", ".mobi"]
+  },
+  "keyword_rules": {
+    "Finance": ["invoice", "statement", "budget"]
+  },
+  "ignore_patterns": ["*.tmp", "keep/**"],
+  "content_read_limit": 256000
+}
+```
+
+Category names cannot contain path separators. Keyword rules take priority over
+extension rules.
+
+## Testing
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## Legacy Experiment
+
+`beta.py` contains the previous Dueling DQN and commander-agent experiment. It
+requires NumPy, TensorFlow, and python-docx:
+
+```powershell
 pip install numpy tensorflow python-docx
+python beta.py --directory path\to\sandbox
 ```
 
----
-
-### 3. **Download the Script**
-- Save the script provided earlier as `file_sorter_agent.py` on your computer.
-
----
-
-### 4. **Run the Script**
-Open a terminal or command prompt and navigate to the directory where the script is saved. Run the script using the following command:
-
-```bash
-python file_sorter_agent.py --directory /path/to/your/directory
-```
-
-- Replace `/path/to/your/directory` with the path to the directory you want to organize.
-- If you don't specify a directory, the script will use the current directory (`.`).
-
----
-
-### 5. **How It Works**
-- The agent scans the directory for files.
-- It reads text files (`.txt`, `.docx`) to extract keywords for better categorization.
-- It moves files into folders based on their types and content (e.g., `.pdf` files to `documents`, `.jpg` files to `images`).
-- It creates dynamic folders (e.g., `work`, `personal`) based on file content or metadata.
-- It logs every file move and folder creation in the terminal.
-- The agent learns from its actions and improves over time.
-
----
-
-### 6. **Example**
-To organize files in the `Downloads` folder, run:
-
-```bash
-python file_sorter_agent.py --directory ~/Downloads
-```
-
----
-
-### 7. **Stopping the Script**
-- The script will stop automatically after organizing all files.
-- To stop it manually, press `Ctrl + C` in the terminal.
-
----
-
-### 8. **Troubleshooting**
-- **Error: No such file or directory**: Ensure the directory path is correct and accessible.
-- **Error: TensorFlow not found**: Make sure TensorFlow is installed correctly (`pip install tensorflow`).
-- **Error: python-docx not found**: Install the `python-docx` library (`pip install python-docx`).
-
----
-
-### 9. **Customization**
-- Modify the `file_types` dictionary in the script to add or change file categories.
-- Adjust the `dynamic_folders` dictionary to customize folder naming based on content.
-- Tune the reward values in the `settings` dictionary to fine-tune the agent's learning.
-
----
-
-### 10. **Future Improvements**
-- **User Feedback**: Allow users to provide feedback on the agent's actions to improve learning.
-- **Advanced Metadata**: Use additional metadata (e.g., tags, author) for better categorization.
-- **Cloud Integration**: Integrate with cloud storage services (e.g., Google Drive, Dropbox) for remote file organization.
-
----
-
-Enjoy an organized directory with the **File-SorterAgent**! 🚀
+Use it only on disposable test files: its untrained policy may classify files
+incorrectly.
